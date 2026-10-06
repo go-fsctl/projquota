@@ -43,6 +43,17 @@
 //   - /etc/projects and /etc/projid are not needed: they are xfs_quota's
 //     name tables, and the kernel never reads them.
 //
+// # On ext4, root is not held to the limit
+//
+// The generic quota code that ext4 uses lets any writer with
+// CAP_SYS_RESOURCE past the hard limits (fs/quota/dquot.c
+// ignore_hardlimit: "return capable_noaudit(CAP_SYS_RESOURCE) && ...").
+// XFS has no such exemption: root gets ENOSPC like everyone else. A file
+// server that writes into an ext4 project directory as root, or with
+// CAP_SYS_RESOURCE, is not limited at all; it must write as an
+// unprivileged uid, or drop that capability. The integration tests check
+// both behaviours.
+//
 // # The owner of a directory can change its project
 //
 // Changing a project id with FS_IOC_FSSETXATTR does NOT require privilege:

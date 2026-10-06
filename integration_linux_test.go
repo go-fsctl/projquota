@@ -8,10 +8,12 @@ package projquota
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -165,11 +167,17 @@ func exercise(t *testing.T, mnt string, want Filesystem, full syscall.Errno) {
 		t.Errorf("statfs(share) files = %d, want %d", st.Files, l.InodeHard)
 	}
 
-	// A file created inside inherits the project.
+	// A file created inside inherits the project. It is written by an
+	// UNPRIVILEGED process: on ext4 a writer with CAP_SYS_RESOURCE ignores
+	// the hard limit (fs/quota/dquot.c ignore_hardlimit), which the first
+	// CI run showed by writing 16 MiB as root under an 8 MiB limit.
+	if err := os.Chown(share, nobody, nobody); err != nil {
+		t.Fatal(err)
+	}
 	data := filepath.Join(share, "data")
-	written, werr := fill(data, 16*mib)
-	t.Logf("%v: wrote %d bytes before %v", want, written, werr)
-	if !errors.Is(werr, full) {
+	written, werr := fillAsNobody(t, mnt, data, 16*mib)
+	t.Logf("%v: uid %d wrote %d bytes before %v", want, nobody, written, werr)
+	if werr != full {
 		t.Fatalf("writing 16 MiB under an 8 MiB limit ended with %v, want %v", werr, full)
 	}
 	if written > l.BlockHard || written < l.BlockHard/2 {
@@ -191,6 +199,18 @@ func exercise(t *testing.T, mnt string, want Filesystem, full syscall.Errno) {
 	if q.Inodes < 2 { // the directory and the file
 		t.Errorf("Usage inodes = %d, want >= 2", q.Inodes)
 	}
+
+	// Root past the limit: XFS still refuses, ext4 lets CAP_SYS_RESOURCE
+	// through. The package documentation warns about the second.
+	_, rerr := fill(filepath.Join(share, "rootdata"), 2*mib)
+	t.Logf("%v: root writing past the limit: %v", want, rerr)
+	if want == XFS && !errors.Is(rerr, syscall.ENOSPC) {
+		t.Errorf("xfs: root wrote past the project limit (%v)", rerr)
+	}
+	if want == Ext4 && rerr != nil {
+		t.Errorf("ext4: root was held to the project limit (%v); CAP_SYS_RESOURCE should ignore it", rerr)
+	}
+	os.Remove(filepath.Join(share, "rootdata"))
 
 	// A soft limit takes over statfs.
 	l.BlockSoft = 4 * mib
@@ -278,8 +298,50 @@ func fill(path string, max uint64) (uint64, error) {
 // ownerCanEscape is the positive control for the package documentation's
 // warning: an UNPRIVILEGED owner of a project directory, in the initial user
 // namespace, can take it out of its project.
+const nobody = 65534
+
+// helper runs this test binary's TestHelper as uid nobody with the given
+// environment and returns its output.
+func helper(t *testing.T, mnt string, env ...string) string {
+	t.Helper()
+	// A copy of this test binary the unprivileged user can execute.
+	bin := filepath.Join(filepath.Dir(mnt), "projquota.test")
+	if _, err := os.Stat(bin); err != nil {
+		self, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		copyFile(t, self, bin)
+	}
+	cmd := exec.Command(bin, "-test.run=^TestHelper$", "-test.v")
+	cmd.Env = append(os.Environ(), env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: nobody, Gid: nobody}}
+	out, err := cmd.CombinedOutput()
+	t.Logf("helper as uid %d:\n%s", nobody, out)
+	if err != nil {
+		t.Fatalf("the helper failed: %v", err)
+	}
+	return string(out)
+}
+
+// fillAsNobody runs fill as uid nobody and returns what it wrote and the
+// errno it stopped on (0 for none).
+func fillAsNobody(t *testing.T, mnt, path string, max uint64) (uint64, syscall.Errno) {
+	t.Helper()
+	out := helper(t, mnt, "PROJQUOTA_HELPER_FILL="+path, fmt.Sprintf("PROJQUOTA_HELPER_MAX=%d", max))
+	var n uint64
+	var errno uintptr
+	i := strings.Index(out, "FILLED ")
+	if i < 0 {
+		t.Fatalf("no FILLED line from the helper")
+	}
+	if _, err := fmt.Sscanf(out[i:], "FILLED %d %d", &n, &errno); err != nil {
+		t.Fatalf("helper output: %v", err)
+	}
+	return n, syscall.Errno(errno)
+}
+
 func ownerCanEscape(t *testing.T, mnt string) {
-	const nobody = 65534
 	dir := filepath.Join(mnt, "tenant")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -291,39 +353,35 @@ func ownerCanEscape(t *testing.T, mnt string) {
 		t.Fatal(err)
 	}
 
-	// A copy of this test binary the unprivileged user can execute.
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	bin := filepath.Join(filepath.Dir(mnt), "projquota.test")
-	copyFile(t, self, bin)
-
-	cmd := exec.Command(bin, "-test.run=^TestOwnerHelper$", "-test.v")
-	cmd.Env = append(os.Environ(), "PROJQUOTA_OWNER_HELPER="+dir)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: nobody, Gid: nobody}}
-	out, err := cmd.CombinedOutput()
-	t.Logf("helper as uid %d:\n%s", nobody, out)
-	if err != nil {
-		t.Fatalf("the helper failed: %v", err)
-	}
+	helper(t, mnt, "PROJQUOTA_HELPER_CLEAR="+dir)
 	if got, inh, err := GetProject(dir); got != 0 || inh || err != nil {
 		t.Errorf("after the owner's change: project %d inherit %v (%v); want 0, false", got, inh, err)
 	}
 }
 
-// TestOwnerHelper runs only as the unprivileged child of ownerCanEscape.
-func TestOwnerHelper(t *testing.T) {
-	dir := os.Getenv("PROJQUOTA_OWNER_HELPER")
-	if dir == "" {
+// TestHelper runs only as the unprivileged child of the integration tests.
+func TestHelper(t *testing.T) {
+	clear, path := os.Getenv("PROJQUOTA_HELPER_CLEAR"), os.Getenv("PROJQUOTA_HELPER_FILL")
+	if clear == "" && path == "" {
 		t.Skip("helper process for TestIntegration*; not run directly")
 	}
 	if os.Geteuid() == 0 {
 		t.Fatal("the helper must not run as root")
 	}
-	if err := SetProject(dir, 0, false); err != nil {
-		t.Fatalf("the owner could not clear the project: %v", err)
+	if clear != "" {
+		if err := SetProject(clear, 0, false); err != nil {
+			t.Fatalf("the owner could not clear the project: %v", err)
+		}
+		return
 	}
+	var max uint64
+	fmt.Sscanf(os.Getenv("PROJQUOTA_HELPER_MAX"), "%d", &max)
+	n, err := fill(path, max)
+	var errno syscall.Errno
+	if err != nil && !errors.As(err, &errno) {
+		t.Fatalf("fill: %v", err)
+	}
+	fmt.Printf("FILLED %d %d\n", n, uintptr(errno))
 }
 
 func copyFile(t *testing.T, src, dst string) {

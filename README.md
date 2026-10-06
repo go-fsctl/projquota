@@ -76,6 +76,16 @@ point. Off Linux every function returns `projquota.ErrUnsupported`.
 - `/etc/projects` and `/etc/projid` are **not** needed: they are
   `xfs_quota`'s name tables and the kernel never reads them.
 
+## ⛔ On ext4, root is not held to the limit
+
+The generic quota code ext4 uses lets any writer with `CAP_SYS_RESOURCE`
+past the hard limits (`fs/quota/dquot.c`, `ignore_hardlimit`). XFS has no
+such exemption. A file server that writes into an ext4 project directory as
+root — or with `CAP_SYS_RESOURCE` — is **not limited at all**: it must write
+as an unprivileged uid or drop the capability. The first CI run found this by
+writing 16 MiB as root under an 8 MiB ext4 limit; the integration tests now
+write as `nobody` and assert both behaviours.
+
 ## ⛔ Do not give the tenant ownership of its directory
 
 Changing a project id does **not** need privilege. `vfs_fileattr_set`
