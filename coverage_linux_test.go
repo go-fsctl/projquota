@@ -241,8 +241,9 @@ func TestSetProjectTreeErrors(t *testing.T) {
 	if err := SetProjectTree(root, invalidProjectID); !errors.Is(err, ErrInvalidProject) {
 		t.Errorf("INVALID_PROJID: %v", err)
 	}
-	// The root must be a real directory, not a link to one.
-	if err := SetProjectTree(filepath.Join(root, "link"), 1); !errors.Is(err, unix.ELOOP) {
+	// The root must be a real directory, not a link to one. Linux answers
+	// O_DIRECTORY|O_NOFOLLOW on a symlink with ENOTDIR, not ELOOP.
+	if err := SetProjectTree(filepath.Join(root, "link"), 1); !errors.Is(err, unix.ENOTDIR) && !errors.Is(err, unix.ELOOP) {
 		t.Errorf("root is a link: %v", err)
 	}
 

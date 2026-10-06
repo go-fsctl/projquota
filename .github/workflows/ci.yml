@@ -57,15 +57,21 @@ jobs:
         with:
           go-version: '1.27.1'
 
-      - name: mkfs.xfs, mkfs.ext4 and the xfs module
+      # ⛔ ext4's quota feature needs the quota_v2 format module; without
+      # it the MOUNT fails with ESRCH ("mount(2) system call failed: No such
+      # process"), which is what the first run of this job said. On the
+      # hosted runner's kernel it lives in linux-modules-extra.
+      - name: mkfs.xfs, mkfs.ext4, and the xfs and quota_v2 modules
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq xfsprogs e2fsprogs
-          if ! sudo modprobe xfs; then
+          if ! { sudo modprobe xfs && sudo modprobe quota_v2; }; then
             sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
             sudo modprobe xfs
+            sudo modprobe quota_v2
           fi
+          lsmod | grep -E "^(xfs|quota_v2) "
           grep -w xfs /proc/filesystems
           grep -w ext4 /proc/filesystems
           uname -r
@@ -75,7 +81,11 @@ jobs:
         run: |
           set -o pipefail
           CGO_ENABLED=0 go test -c -o projquota.test .
-          sudo ./projquota.test -test.count=1 -test.v -test.run '^TestIntegration' 2>&1 | tee kernel-output.txt
+          # bash -e would stop at the failing pipeline; keep its status.
+          status=0
+          sudo ./projquota.test -test.count=1 -test.v -test.run '^TestIntegration' 2>&1 | tee kernel-output.txt || status=$?
+          [ $status -eq 0 ] || sudo dmesg | tail -40
+          exit $status
 
       # A skip is a failure here: the environment exists, so a test that
       # skipped did not judge anything.

@@ -99,20 +99,24 @@ func TestIntegrationXFS(t *testing.T) {
 	requireRoot(t, "mkfs.xfs")
 	// 512 MiB: recent xfsprogs refuses filesystems under 300 MB.
 	mnt := mountImage(t, 512*mib, "prjquota", "mkfs.xfs", "-q", "-f")
-	exercise(t, mnt, XFS)
+	// XFS reports an exhausted PROJECT quota as a full filesystem:
+	// fs/xfs/xfs_trans_dquot.c, "if (xfs_dquot_type(dqp) ==
+	// XFS_DQTYPE_PROJ) return -ENOSPC; return -EDQUOT;".
+	exercise(t, mnt, XFS, syscall.ENOSPC)
 }
 
 func TestIntegrationExt4(t *testing.T) {
 	requireRoot(t, "mkfs.ext4")
 	// The project feature needs inodes larger than 128 bytes; the quota
 	// feature keeps the quota files as hidden inodes, so no quotacheck or
-	// quotaon is needed.
+	// quotaon is needed -- but the kernel must have the quota_v2 format
+	// (CONFIG_QFMT_V2), or the mount itself fails with ESRCH.
 	mnt := mountImage(t, 128*mib, "prjquota", "mkfs.ext4", "-q", "-F", "-O", "quota,project", "-I", "256")
-	exercise(t, mnt, Ext4)
+	exercise(t, mnt, Ext4, syscall.EDQUOT)
 }
 
 // exercise is the same scenario on either filesystem.
-func exercise(t *testing.T, mnt string, want Filesystem) {
+func exercise(t *testing.T, mnt string, want Filesystem, full syscall.Errno) {
 	if got, err := Detect(mnt); got != want || err != nil {
 		t.Fatalf("Detect(%s) = %v, %v; want %v", mnt, got, err, want)
 	}
@@ -165,8 +169,8 @@ func exercise(t *testing.T, mnt string, want Filesystem) {
 	data := filepath.Join(share, "data")
 	written, werr := fill(data, 16*mib)
 	t.Logf("%v: wrote %d bytes before %v", want, written, werr)
-	if !errors.Is(werr, syscall.EDQUOT) {
-		t.Fatalf("writing 16 MiB under an 8 MiB limit ended with %v, want EDQUOT", werr)
+	if !errors.Is(werr, full) {
+		t.Fatalf("writing 16 MiB under an 8 MiB limit ended with %v, want %v", werr, full)
 	}
 	if written > l.BlockHard || written < l.BlockHard/2 {
 		t.Errorf("EDQUOT after %d bytes, want it near the %d-byte limit", written, l.BlockHard)

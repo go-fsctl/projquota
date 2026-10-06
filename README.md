@@ -65,7 +65,9 @@ point. Off Linux every function returns `projquota.ErrUnsupported`.
   block device behind the mount; this package does not go looking for it.
 - **Project quotas on the mount.** XFS: `mount -o prjquota`. ext4: a
   filesystem made with `mkfs.ext4 -O quota,project -I 256` (the project
-  feature needs inodes larger than 128 bytes) and mounted with `-o prjquota`.
+  feature needs inodes larger than 128 bytes) and mounted with `-o prjquota`;
+  the kernel needs the `quota_v2` format module (`CONFIG_QFMT_V2`), or the
+  mount fails with `ESRCH` (on Ubuntu it ships in `linux-modules-extra`).
 - **`CAP_SYS_ADMIN` for `SetLimits` and for `Usage`.** The kernel lets an
   unprivileged caller read only its own user and group quotas, never a
   project's (`fs/quota/quota.c`, `check_quotactl_permission`).
@@ -99,6 +101,11 @@ limits are rounded **up** to those units, as the kernel's own conversions
 (`quota_btobb`, `stoqb`) do — and XFS rounds up again to its filesystem
 block. `Usage` reads back what was stored. On ext4 `Quota.Bytes` is exact; on
 XFS it is a multiple of 512.
+
+**A full project is `ENOSPC` on XFS, `EDQUOT` on ext4.** XFS reports an
+exhausted project quota as a full filesystem
+(`fs/xfs/xfs_trans_dquot.c`: `if (xfs_dquot_type(dqp) == XFS_DQTYPE_PROJ)
+return -ENOSPC;`); a file server should treat both as "share full".
 
 Three things the kernel does that this package makes explicit:
 

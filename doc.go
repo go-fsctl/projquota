@@ -12,7 +12,9 @@
 // carries a project id, a directory with FS_XFLAG_PROJINHERIT hands its id
 // to whatever is created inside it, and the filesystem charges the space and
 // inodes of all those files to the project. Once the hard limit is reached,
-// writes fail with EDQUOT. statfs(2) -- and so df(1) -- of a directory that
+// writes fail -- with EDQUOT on ext4, but with ENOSPC on XFS, which reports
+// an exhausted project quota as a full filesystem (fs/xfs/xfs_trans_dquot.c:
+// "if (xfs_dquot_type(dqp) == XFS_DQTYPE_PROJ) return -ENOSPC;"). statfs(2) -- and so df(1) -- of a directory that
 // carries FS_XFLAG_PROJINHERIT reports the project's limit as the size of the
 // filesystem: the SOFT limit when one is set, else the hard limit
 // (fs/xfs/xfs_qm_bhv.c xfs_fill_statvfs_from_dquot, called when project
@@ -29,6 +31,9 @@
 //     larger than 128 bytes (mkfs.ext4 -O quota,project -I 256), mounted with
 //     -o prjquota. Without the project feature ext4 refuses any non-zero
 //     project id with EOPNOTSUPP (fs/ext4/ioctl.c ext4_ioctl_setproject).
+//     The kernel also needs the quota_v2 format (CONFIG_QFMT_V2, module
+//     quota_v2): without it the mount itself fails with ESRCH
+//     (fs/quota/dquot.c: find_quota_format fails, "return -ESRCH").
 //   - XFS project ids above 65535 need the projid32bit feature, the default
 //     of mkfs.xfs for years (fs/xfs/xfs_ioctl.c
 //     xfs_ioctl_setattr_check_projid returns EINVAL otherwise).
