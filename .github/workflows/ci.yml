@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  COVERAGE_FLOOR: "100.0"
+
+jobs:
+  native:
+    name: native (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+      - name: Build
+        run: CGO_ENABLED=0 go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test (with coverage gate)
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go test -count=1 -covermode=atomic -coverprofile=cover.out ./...
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {sub(/%/,"",$3); print $3}')
+          echo "Total coverage: ${total}% (floor ${COVERAGE_FLOOR}%)"
+          awk -v c="$total" -v m="$COVERAGE_FLOOR" 'BEGIN { exit (c+0 >= m+0) ? 0 : 1 }' \
+            || { echo "Coverage ${total}% below floor ${COVERAGE_FLOOR}%"; exit 1; }
+
+  # The integration tests make a real XFS and a real ext4 filesystem in
+  # loop-mounted image files and drive FS_IOC_FSSETXATTR and quotactl_fd
+  # against them as root: project id, limits, EDQUOT at the limit, Usage,
+  # statfs reporting the limit, a populated tree, and an unprivileged owner
+  # taking its directory out of the project. A hosted runner has root, loop
+  # devices and both filesystems in its kernel.
+  kernel:
+    name: kernel (XFS + ext4 project quotas, root)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+
+      - name: mkfs.xfs, mkfs.ext4 and the xfs module
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs e2fsprogs
+          if ! sudo modprobe xfs; then
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+            sudo modprobe xfs
+          fi
+          grep -w xfs /proc/filesystems
+          grep -w ext4 /proc/filesystems
+          uname -r
+
+      # Built as the runner user, run as root: sudo's PATH has no go.
+      - name: the integration tests, as root
+        run: |
+          set -o pipefail
+          CGO_ENABLED=0 go test -c -o projquota.test .
+          sudo ./projquota.test -test.count=1 -test.v -test.run '^TestIntegration' 2>&1 | tee kernel-output.txt
+
+      # A skip is a failure here: the environment exists, so a test that
+      # skipped did not judge anything.
+      - name: the kernel judges must have judged
+        run: |
+          if grep -E -- "--- SKIP|integration: " kernel-output.txt; then
+            echo "::error::an integration test skipped; the filesystems were not used"
+            exit 1
+          fi
+          n=$(grep -c -- "--- PASS: TestIntegration" kernel-output.txt || true)
+          echo "integration tests passed: $n"
+          test "$n" -eq 2 || { echo "::error::$n of 2 integration tests passed"; exit 1; }
+
+  emulated:
+    name: emulated (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu_cpu: "rv64,v=true,vlen=128"
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: "la464"
+          - arch: ppc64le
+            image: debian:trixie
+            qemu_cpu: "power9"
+          - arch: s390x
+            image: debian:trixie
+            qemu_cpu: "qemu"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+      - name: Set up binfmt (QEMU)
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+      - name: Cross-compile per-package test binaries
+        run: |
+          set -euo pipefail
+          mkdir -p testbins
+          for pkg in $(go list ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            # Skip packages that genuinely have no test files; everything else
+            # MUST compile. A failed compile here is a real error and fails the
+            # job — we do not swallow it (a swallowed s390x build break once let a
+            # whole arch silently skip its coverage gate).
+            hastests=$(go list -f '{{if or .TestGoFiles .XTestGoFiles}}yes{{end}}' "$pkg")
+            if [ -z "$hastests" ]; then
+              echo "no test files for $pkg, skipping"
+              continue
+            fi
+            echo "Compiling test binary for $pkg"
+            CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+              go test -c -covermode=atomic -o "testbins/${name}.test" "$pkg"
+          done
+          ls -l testbins
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for bin in testbins/*.test; do
+            echo "::group::Running $bin on linux/${{ matrix.arch }}"
+            docker run --rm --platform linux/${{ matrix.arch }} \
+              -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+              -v "$PWD":/work -w /work \
+              ${{ matrix.image }} \
+              "/work/$bin" -test.v -test.short
+            echo "::endgroup::"
+          done
